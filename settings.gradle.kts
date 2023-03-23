@@ -8,4 +8,5 @@
  */
 
 rootProject.name = "monocleimage"
-include("app", "list", "utilities")
+
+include("app", "lib")
