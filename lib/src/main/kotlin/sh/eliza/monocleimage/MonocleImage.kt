@@ -1,9 +1,14 @@
 package sh.eliza.monocleimage
 
-import java.util.zip.Deflater
-import java.util.zip.Inflater
+import heatshrink.HsInputStream
+import heatshrink.HsOutputStream
+import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
 import kotlin.math.max
 import kotlin.math.min
+
+private const val HEATSHRINK_WINDOW_SIZE = 9
+private const val HEATSHRINK_LOOKAHEAD_SIZE = 8
 
 // Conversions to/from full-range YCbCr.
 // Source: https://web.archive.org/web/20180421030430/http://www.equasys.de/colorconversion.html
@@ -26,36 +31,33 @@ private fun yuv2b(y: Int, u: Int, v: Int) =
   (1.000 * y + 1.765 * (u - 128.0) + 0.000 * (v - 128.0)).coerceIn(0.0, 255.0)
 
 private fun compress(input: List<Byte>): List<Byte> {
-  val deflater = Deflater(Deflater.BEST_COMPRESSION)
-  return try {
-    deflater.setInput(input.toByteArray())
-    deflater.finish()
-    val result = mutableListOf<Byte>()
-    val buffer = ByteArray(1024)
-    while (!deflater.finished()) {
-      val count = deflater.deflate(buffer)
-      result.addAll(buffer.take(count))
-    }
-    result.toList()
-  } finally {
-    deflater.end()
-  }
+  val byteStream = ByteArrayOutputStream(input.size)
+  val stream = HsOutputStream(byteStream, HEATSHRINK_WINDOW_SIZE, HEATSHRINK_LOOKAHEAD_SIZE)
+  stream.write(input.toByteArray())
+  stream.flush()
+  return byteStream.toByteArray().toList()
 }
 
 private fun decompress(input: List<Byte>): List<Byte> {
-  val inflater = Inflater()
-  return try {
-    inflater.setInput(input.toByteArray())
-    val result = mutableListOf<Byte>()
-    val buffer = ByteArray(1024)
-    while (!inflater.finished()) {
-      val count = inflater.inflate(buffer)
-      result.addAll(buffer.take(count))
+  val result = mutableListOf<Byte>()
+  val buffer = ByteArray(input.size)
+
+  HsInputStream(
+      ByteArrayInputStream(input.toByteArray()),
+      HEATSHRINK_WINDOW_SIZE,
+      HEATSHRINK_LOOKAHEAD_SIZE
+    )
+    .use { stream ->
+      while (true) {
+        val count = stream.read(buffer)
+        if (count <= 0) {
+          break
+        }
+        result.addAll(buffer.take(count))
+      }
     }
-    result.toList()
-  } finally {
-    inflater.end()
-  }
+
+  return result.toList()
 }
 
 private class RowBuffer(
@@ -72,15 +74,15 @@ private class RowBuffer(
       emptyPairCount++
       return
     }
-    if (emptyPairCount > 0) {
-      if (offset === null) {
-        offset = colPair
-      } else {
-        // Backfill with skipped blank pairs.
-        data.addAll(generateSequence { emptyValueByte }.take(emptyPairCount * 2))
-      }
-      emptyPairCount = 0
+
+    if (offset === null) {
+      offset = colPair
+    } else if (emptyPairCount > 0) {
+      // Backfill with skipped blank pairs.
+      data.addAll(generateSequence { emptyValueByte }.take(emptyPairCount * 2))
     }
+    emptyPairCount = 0
+
     data.add(b1.toInt().toByte())
     data.add(b2.toInt().toByte())
   }
@@ -123,6 +125,9 @@ data class MonocleImage(
     val uvEmptyPair = Pair(0x80, 0x80)
 
     for (row in (yRows.keys + uvRows.keys).distinct()) {
+      val deinterlacedRow = row / 2
+      val deinterlacedColOffset = (row % 2) * WIDTH / 2
+
       val yRow = yRows[row]
       val uvRow = uvRows[row]
 
@@ -146,10 +151,9 @@ data class MonocleImage(
       }
 
       for (colPair in
-        min(yRow?.offset ?: WIDTH / 2, uvRow?.offset ?: WIDTH / 2) until
+        min(yRow?.offset ?: WIDTH / 4, uvRow?.offset ?: WIDTH / 4) until
           max((yRow?.offset ?: 0) + yData.size / 2, (uvRow?.offset ?: 0) + uvData.size / 2)) {
-        val col1 = colPair * 2
-        val col2 = col1 + 1
+        val deinterlacedCol = deinterlacedColOffset + colPair * 2
 
         val (y1, y2) = yRow?.pairAt(colPair, yData, yEmptyPair) ?: yEmptyPair
         val (u, v) = uvRow?.pairAt(colPair, uvData, uvEmptyPair) ?: uvEmptyPair
@@ -164,8 +168,8 @@ data class MonocleImage(
         val rgb1 = (r1 shl 16) or (g1 shl 8) or (b1 shl 0)
         val rgb2 = (r2 shl 16) or (g2 shl 8) or (b2 shl 0)
 
-        setRgb(row, col1, rgb1)
-        setRgb(row, col2, rgb2)
+        setRgb(deinterlacedRow, deinterlacedCol + 0, rgb1)
+        setRgb(deinterlacedRow, deinterlacedCol + 1, rgb2)
       }
     }
   }
@@ -178,16 +182,18 @@ data class MonocleImage(
       val yRows = mutableMapOf<Int, Row>()
       val uvRows = mutableMapOf<Int, Row>()
 
-      for (row in 0 until HEIGHT) {
+      for (row in 0 until HEIGHT * 2) {
+        val deinterlacedRow = row / 2
+        val deinterlacedColOffset = (row % 2) * WIDTH / 2
+
         val yBuffer = RowBuffer(0.0)
         val uvBuffer = RowBuffer(128.0)
 
-        for (colPair in 0 until WIDTH / 2) {
-          val col1 = colPair * 2
-          val col2 = col1 + 1
+        for (colPair in 0 until WIDTH / 4) {
+          val deinterlacedCol = deinterlacedColOffset + colPair * 2
 
-          val rgb1 = getRgb(row, col1)
-          val rgb2 = getRgb(row, col2)
+          val rgb1 = getRgb(deinterlacedRow, deinterlacedCol + 0)
+          val rgb2 = getRgb(deinterlacedRow, deinterlacedCol + 1)
 
           val r1 = (rgb1 shr 16) and 0xFF
           val g1 = (rgb1 shr 8) and 0xFF
@@ -207,7 +213,7 @@ data class MonocleImage(
           val v = ((v1 + v2) / 2.0)
 
           yBuffer.push(colPair, y1, y2)
-          uvBuffer.push(colPair, u1, v1)
+          uvBuffer.push(colPair, u, v)
         }
 
         yBuffer.toRow()?.let { yRows[row] = it }
