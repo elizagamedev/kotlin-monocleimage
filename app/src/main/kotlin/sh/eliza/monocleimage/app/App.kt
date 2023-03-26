@@ -4,16 +4,37 @@ import java.awt.image.BufferedImage
 import java.io.File
 import javax.imageio.ImageIO
 import sh.eliza.monocleimage.MonocleImage
+import sh.eliza.monocleimage.SerializedMonocleImage
+import sh.eliza.monocleimage.SerializedMonocleImageReceiver
+import sh.eliza.monocleimage.SerializedMonocleImageSender
 
 fun main(args: Array<String>) {
   val image = createMonocleImageFromPath(args[0])
-  saveMonocleImageToPath(image, args[1])
-
-  val yBytes = image.yRows.values.map { it.data.size }.sum()
-  val uvBytes = image.uvRows.values.map { it.data.size }.sum()
-
   println("yRows.size = ${image.yRows.size}, uvRows.size = ${image.uvRows.size}")
-  println("approximately ${yBytes + uvBytes} bytes (y = $yBytes, uv = $uvBytes)")
+
+  // Serialize and simulate sending over the wire.
+  val serializedImage = SerializedMonocleImage.createFromMonocleImage(image, mtu = 512)
+  val serializedImageSize = serializedImage.payloads.map { it.data.size }.sum()
+  println(
+    "serialized image is $serializedImageSize bytes over ${serializedImage.payloads.size} payloads"
+  )
+
+  val sender = SerializedMonocleImageSender(serializedImage)
+  val receiver = SerializedMonocleImageReceiver()
+
+  while (!sender.isDone) {
+    val payload = sender.next()
+    if (payload.isConfirmation) {
+      sender.onConfirmationResponse(receiver.onRequestConfirmation(payload.data.toByteArray()))
+    } else {
+      receiver.push(payload.data)
+    }
+  }
+
+  check(receiver.isDone) { "Receiver should be done by now!" }
+  val receivedImage = receiver.toMonocleImage()
+
+  saveMonocleImageToPath(receivedImage, args[1])
 }
 
 private fun saveMonocleImageToPath(monocleImage: MonocleImage, path: String) {
